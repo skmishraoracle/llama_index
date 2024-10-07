@@ -1,4 +1,3 @@
-# OopCompanion:suppressRename
 from __future__ import annotations
 
 import array
@@ -8,6 +7,8 @@ import logging
 import math
 import os
 import uuid
+import numpy as np
+
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -63,35 +64,7 @@ class DistanceStrategy(Enum):
 T = TypeVar("T", bound=Callable[..., Any])
 
 
-def _handle_exceptions(func: T) -> T:
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except RuntimeError as db_err:
-            # Handle a known type of error (e.g., DB-related) specifically
-            logger.exception("DB-related error occurred.")
-            raise RuntimeError(f"Failed due to a DB issue: {db_err}") from db_err
-        except ValueError as val_err:
-            # Handle another known type of error specifically
-            logger.exception("Validation error.")
-            raise ValueError(f"Validation failed: {val_err}") from val_err
-        except Exception as e:
-            # Generic handler for all other exceptions
-            logger.exception(f"An unexpected error occurred: {e}")
-            raise RuntimeError(f"Unexpected error: {e}") from e
-
-    return cast(T, wrapper)
-
-
-def _escape_str(value: str) -> str:
-    BS = "\\"
-    must_escape = (BS, "'")
-    return (
-        "".join(f"{BS}{c}" if c in must_escape else c for c in value) if value else ""
-    )
-
-
+# Define column config
 column_config: Dict = {
     "id": {"type": "VARCHAR2(64) PRIMARY KEY", "extract_func": lambda x: x.node_id},
     "doc_id": {"type": "VARCHAR2(64)", "extract_func": lambda x: x.ref_doc_id},
@@ -118,11 +91,82 @@ column_config: Dict = {
 }
 
 
+def _handle_exceptions(func: T) -> T:
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except RuntimeError as db_err:
+            # Handle a known type of error (e.g., DB-related) specifically
+            logger.exception("DB-related error occurred.")
+            raise RuntimeError(f"Failed due to a DB issue: {db_err}") from db_err
+        except ValueError as val_err:
+            # Handle another known type of error specifically
+            logger.exception("Validation error.")
+            raise ValueError(f"Validation failed: {val_err}") from val_err
+        except Exception as e:
+            # Generic handler for all other exceptions
+            logger.exception(f"An unexpected error occurred: {e}")
+            raise RuntimeError(f"Unexpected error: {e}") from e
+
+    return cast(T, wrapper)
+
+
+def _compare_version(version: str, target_version: str) -> bool:
+    # Split both version strings into parts
+    version_parts = [int(part) for part in version.split(".")]
+    target_parts = [int(part) for part in target_version.split(".")]
+
+    # Compare each part
+    for v, t in zip(version_parts, target_parts):
+        if v < t:
+            return True  # Current version is less
+        elif v > t:
+            return False  # Current version is greater
+
+    # If all parts equal so far, check if version has fewer parts than target_version
+    return len(version_parts) < len(target_parts)
+
+
+def _escape_str(value: str) -> str:
+    BS = "\\"
+    must_escape = (BS, "'")
+    return (
+        "".join(f"{BS}{c}" if c in must_escape else c for c in value) if value else ""
+    )
+
+
 def _stringify_list(lst: List) -> str:
     return "[" + ",".join(str(item) for item in lst) + "]"
 
 
-def _table_exists(connection: Connection, table_name: str) -> bool:
+def _get_connection(client: Any) -> Connection | None:
+    # Dynamically import oracledb and the required classes
+    try:
+        import oracledb
+    except ImportError as e:
+        raise ImportError(
+            "Unable to import oracledb, please install with "
+            "`pip install -U oracledb`."
+        ) from e
+
+    # check if ConnectionPool exists
+    connection_pool_class = getattr(oracledb, "ConnectionPool", None)
+
+    if isinstance(client, oracledb.Connection):
+        return client
+    elif connection_pool_class and isinstance(client, connection_pool_class):
+        return client.acquire()
+    else:
+        valid_types = "oracledb.Connection"
+        if connection_pool_class:
+            valid_types += " or oracledb.ConnectionPool"
+        raise TypeError(
+            f"Expected client of type {valid_types}, got {type(client).__name__}"
+        )
+
+
+def _table_exists(client: Connection, table_name: str) -> bool:
     try:
         import oracledb
     except ImportError as e:
@@ -131,7 +175,7 @@ def _table_exists(connection: Connection, table_name: str) -> bool:
             "`pip install -U oracledb`."
         ) from e
     try:
-        with connection.cursor() as cursor:
+        with client.cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             return True
     except oracledb.DatabaseError as ex:
@@ -142,13 +186,13 @@ def _table_exists(connection: Connection, table_name: str) -> bool:
 
 
 @_handle_exceptions
-def _index_exists(connection: Connection, index_name: str) -> bool:
+def _index_exists(client: Connection, index_name: str) -> bool:
     # Check if the index exists
     query = (
         "SELECT index_name FROM all_indexes WHERE upper(index_name) = upper(:idx_name)"
     )
 
-    with connection.cursor() as cursor:
+    with client.cursor() as cursor:
         # Execute the query
         cursor.execute(query, idx_name=index_name.upper())
         result = cursor.fetchone()
@@ -200,10 +244,13 @@ def _create_table(connection: Connection, table_name: str) -> None:
 
 @_handle_exceptions
 def create_index(
-    connection: Connection,
+    client: Any,
     vector_store: OraLlamaVS,
     params: Optional[dict[str, Any]] = None,
 ) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failed to acquire a connection.")
     if params:
         if params["idx_type"] == "HNSW":
             _create_hnsw_index(
@@ -226,6 +273,10 @@ def create_index(
                 vector_store.distance_strategy,
                 params,
             )
+    else:
+        _create_hnsw_index(
+            connection, vector_store.table_name, vector_store.distance_strategy, params
+        )
 
 
 @_handle_exceptions
@@ -355,10 +406,12 @@ def _create_ivf_index(
 
 
 @_handle_exceptions
-def drop_table_purge(connection: Connection, table_name: str) -> None:
-    if _table_exists(connection, table_name):
-        cursor = connection.cursor()
-        with cursor:
+def drop_table_purge(client: Any, table_name: str) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failure to acquire connection.")
+    if _table_exists(client, table_name):
+        with connection.cursor() as cursor:
             ddl = f"DROP TABLE {table_name} PURGE"
             cursor.execute(ddl)
         logger.info("Table dropped successfully...")
@@ -367,10 +420,13 @@ def drop_table_purge(connection: Connection, table_name: str) -> None:
 
 
 @_handle_exceptions
-def drop_index_if_exists(connection: Connection, index_name: str):
-    if _index_exists(connection, index_name):
+def drop_index_if_exists(client: Connection, index_name: str) -> None:
+    connection = _get_connection(client)
+    if connection is None:
+        raise ValueError("Failure to acquire connection.")
+    if _index_exists(client, index_name):
         drop_query = f"DROP INDEX {index_name}"
-        with connection.cursor() as cursor:
+        with client.cursor() as cursor:
             cursor.execute(drop_query)
             logger.info(f"Index {index_name} has been dropped.")
     else:
@@ -395,12 +451,13 @@ class OraLlamaVS(BasePydanticVectorStore):
                 print ("Database version:", connection.version)
     """
 
-    AMPLIFY_RATIO_LE5: ClassVar[int] = 100
-    AMPLIFY_RATIO_GT5: ClassVar[int] = 20
-    AMPLIFY_RATIO_GT50: ClassVar[int] = 10
+    AMPLIFY_RATIO_LE5 = 100
+    AMPLIFY_RATIO_GT5 = 20
+    AMPLIFY_RATIO_GT50 = 10
     metadata_column: str = "metadata"
     stores_text: bool = True
     _client: Connection = PrivateAttr()
+    _insert_mode: Optional[str] = PrivateAttr()
     table_name: str
     distance_strategy: DistanceStrategy
     batch_size: Optional[int]
@@ -433,6 +490,40 @@ class OraLlamaVS(BasePydanticVectorStore):
             # Assign _client to PrivateAttr after the Pydantic initialization
             object.__setattr__(self, "_client", _client)
             _create_table(_client, table_name)
+
+            # Check Oracle client version and insert_mode logic
+            if hasattr(_client, "thin") and _client.thin:
+                # For thin clients, check OracleDB Python version
+                if oracledb.__version__ == "2.1.0":
+                    raise Exception(
+                        "Oracle DB python thin client driver version 2.1.0 is not supported"
+                    )
+                elif _compare_version(oracledb.__version__, "2.2.0"):
+                    object.__setattr__(self, "_insert_mode", "clob")
+                else:
+                    object.__setattr__(self, "_insert_mode", "array")
+            else:
+                # For thick clients, check client and driver versions
+                if _compare_version(
+                    oracledb.__version__, "2.1.0"
+                ) and not _compare_version(
+                    ".".join(map(str, oracledb.clientversion())), "23.4"
+                ):
+                    raise Exception(
+                        "Oracle DB python thick client driver version earlier than "
+                        "2.1.0 is not supported with client libraries greater than or equal to 23.4"
+                    )
+
+                if _compare_version(
+                    ".".join(map(str, oracledb.clientversion())), "23.4"
+                ):
+                    object.__setattr__(self, "_insert_mode", "clob")
+                else:
+                    object.__setattr__(self, "_insert_mode", "array")
+
+                # Additional check for versions 2.1.0 and higher
+                if _compare_version(oracledb.__version__, "2.1.0"):
+                    object.__setattr__(self, "_insert_mode", "clob")
 
         except oracledb.DatabaseError as db_err:
             logger.exception(f"Database error occurred while create table: {db_err}")
@@ -475,9 +566,39 @@ class OraLlamaVS(BasePydanticVectorStore):
     def _build_insert(self, values: List[BaseNode]) -> (str, List[tuple]):
         _data = []
         for item in values:
-            item_values = tuple(
-                column["extract_func"](item) for column in column_config.values()
-            )
+            item_values = []
+            for (
+                col_name,
+                col_conf,
+            ) in column_config.items():  # Ensure column_config is defined
+                if col_name == "embedding":
+                    embedding = col_conf["extract_func"](item)
+
+                    if (
+                        self._insert_mode == "clob"
+                    ):  # Ensure self._insert_mode is defined
+                        embedding_arr = json.dumps(embedding)
+                    else:
+                        if isinstance(embedding, str):
+                            try:
+                                embedding = json.loads(embedding)
+                            except json.JSONDecodeError:
+                                raise ValueError(
+                                    "Invalid embedding format. Expected a JSON string representing a list or numpy array."
+                                )
+
+                        # Additional type check if needed
+                        if not isinstance(embedding, (list, np.ndarray)):
+                            raise ValueError(
+                                "Invalid embedding format. Expected a list or numpy array of floats."
+                            )
+
+                        embedding_arr = array.array("f", embedding)
+
+                    item_values.append(embedding_arr)
+                else:
+                    item_values.append(col_conf["extract_func"](item))
+
             _data.append(item_values)
 
         dml = f"""
@@ -522,23 +643,29 @@ class OraLlamaVS(BasePydanticVectorStore):
     def add(self, nodes: list[BaseNode], **kwargs: Any) -> list[str]:
         if not nodes:
             return []
+        connection = _get_connection(self._client)
+        if connection is None:
+            raise ValueError("Failure to acquire connection.")
 
         for result_batch in iter_batch(nodes, self.batch_size):
             dml, bind_values = self._build_insert(values=result_batch)
 
-            with self._client.cursor() as cursor:
+            with connection.cursor() as cursor:
                 # Use executemany to insert the batch
                 cursor.executemany(dml, bind_values)
-                self._client.commit()
+                connection.commit()
 
         return [node.node_id for node in nodes]
 
     @_handle_exceptions
     def delete(self, doc_id: str, **kwargs: Any) -> None:
-        with self._client.cursor() as cursor:
+        connection = _get_connection(self._client)
+        if connection is None:
+            raise ValueError("Failure to acquire connection.")
+        with connection.cursor() as cursor:
             ddl = f"DELETE FROM {self.table_name} WHERE id = :doc_id"
             cursor.execute(ddl, [doc_id])
-            self._client.commit()
+            connection.commit()
 
     @_handle_exceptions
     def _get_clob_value(self, result: Any) -> str:
@@ -606,7 +733,10 @@ class OraLlamaVS(BasePydanticVectorStore):
             logger.debug(f"hybrid query_statement={query_statement}")
         """
         embedding = array.array("f", query.query_embedding)
-        with self._client.cursor() as cursor:
+        connection = _get_connection(self._client)
+        if connection is None:
+            raise ValueError("Failure to acquire connection.")
+        with connection.cursor() as cursor:
             cursor.execute(query_sql, embedding=embedding)
             results = cursor.fetchall()
 
